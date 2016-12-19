@@ -1,0 +1,1532 @@
+#!/usr/bin/python
+
+###########################################################################
+#
+# OpenSwitch temperature control application
+#
+# Copyright (c) 2016 Dell Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License"); you may
+# not use this file except in compliance with the License. You may obtain
+# a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
+#
+# THIS CODE IS PROVIDED ON AN  *AS IS* BASIS, WITHOUT WARRANTIES OR
+# CONDITIONS OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT
+# LIMITATION ANY IMPLIED WARRANTIES OR CONDITIONS OF TITLE, FITNESS
+# FOR A PARTICULAR PURPOSE, MERCHANTABLITY OR NON-INFRINGEMENT.
+#
+# See the Apache Version 2.0 License for specific language governing
+# permissions and limitations under the License.
+#
+# SYNOPSIS
+#
+# opx_env_tmpctl_svc [ -f <config-file> ]
+#
+# where:
+#
+# <config-file> is a JSON configuration file.
+#
+# DESCRIPTION
+#
+# This application has two goals: (1) to control fan speeds, and
+# (2) to publish CPS API events for temperature faults.
+#
+# Both goals are driven by temperature threshold-crossing CPS API events
+# published by PAS.  The programming of these thresholds is the responsibility
+# of the temperature control application.
+#
+# What the threshold temperatures are, and what to do when a threshold is
+# crossed, is described in a configuration file.  See the JSON schema
+# listed below for a desription of the syntax and semantics of this
+# file.
+#
+# Cooling (fan-speed control)
+#
+# Cooling is done based on zones.  Each zone has an arbitrary, unique name.
+# Cooling thresholds describe rules such that when a sensor crosses a
+# temperature threshold, the cooling level for that sensor in the given zone
+# is set to a given value, from 0..N.  The cooling level of a zone is the
+# maximum level of all sensors reporting in that zone.  Zone cooling levels 
+# specify how fans in a given zone are set for the cooling level of that zone.
+#
+# Faults
+#
+# There are 5 fault levels: nominal (no fault), warning, minor, major and
+# ciritical.  Fault thresholds configure the temperatures for transitioning
+# between fault levels.  A CPS API event is published whenever the fault
+# level changes.
+#
+# Note that there is a single set of fault thresholds, for all sensors.
+# Therefore, faults are dictated by the sensor that is running the hottest.
+#
+# CPS API interface
+#
+# In addition to publishing CPS API events for faults, this application
+# serves as the owner for the temperature fault threshold object, allowing
+# other applications to get and set fault thresholds.
+#
+# EXIT STATUS
+#
+# Normally, this application never terminates.  If one of the following
+# errors occurs, this application will terminate with the given exit code:
+#
+# Error in reading configuration file - exit code 1
+# Error in initial hardware probe     - exit code 2
+#
+# FILES
+#
+# /etc/env-tmpctl/config.json - Default configuration file
+#
+###########################################################################
+
+import sys
+import json
+import re
+import optparse
+import threading
+import copy
+import cps
+import cps_utils
+import cps_object
+import event_log
+import time
+
+log_modname  = 'ENV_TMPCTL'     # Module name, for logging
+log_filename = sys._getframe().f_code.co_filename # Filename, for logging
+cps_ev_hdl = None               # CPS API event service handle
+mutex = None                    # Mutex for access to global data
+config = None                   # Configuration, read from JSON file
+entity_faults = {}              # Active entity faults
+entity_info = {}                # Known attributes of all entities
+airflow_configured = None       # Configured airflow, None => not configured
+airflow_current = None          # Current airflow, None => unknown
+zone_sensor_levels = {}         # Cooling levels, for each zone and sensor
+temperature_fault_cfg_orig = {}             # Original temperature fault configuration, from config file
+temperature_fault_master_thresh_idx = None  # Index of masther fault thresholds
+temperature_fault_sensor_levels = {}        # Temperature fault levels, for each sensor
+fan_faults = set()
+
+def trace(log_id, log_funcname, log_linenum, mesg):
+    event_log.logging(log_modname, event_log.DEBUG, log_id, log_filename, log_funcname, log_linenum, mesg)
+
+def notice(log_id, log_funcname, log_linenum, mesg):
+    event_log.logging(log_modname, event_log.NOTICE, log_id, log_filename, log_funcname, log_linenum, mesg)
+
+def warning(log_id, log_funcname, log_linenum, mesg):
+    event_log.logging(log_modname, event_log.WARNING, log_id, log_filename, log_funcname, log_linenum, mesg)
+
+def error(log_id, log_funcname, log_linenum, mesg):
+    event_log.logging(log_modname, event_log.ERR, log_id, log_filename, log_funcname, log_linenum, mesg)
+
+class Cps_Exception(Exception):
+    pass
+
+# Extract attribute from CPS API object
+
+def cps_attr_data_get(obj, attr):
+    log_id = 'cps-api'
+    log_funcname = sys._getframe().f_code.co_name
+    d = obj['data']
+    if attr not in d:
+        error(log_id, log_funcname, sys._getframe().f_lineno,
+              'CPS API object attribute not found'
+              )
+        return None
+    return cps_utils.cps_attr_types_map.from_data(attr, d[attr])
+
+# Do a CPS API get
+
+def cps_get(obj, attrs={}):
+    log_id = 'cps-api'
+    log_funcname = sys._getframe().f_code.co_name
+    resp = []
+    if cps.get([cps_object.CPSObject(obj, qual='observed', data=attrs).get()], resp):
+        return resp
+    error(log_id, log_funcname, sys._getframe().f_lineno,
+          'CPS API get failed'
+          )
+    raise Cps_Exception
+
+# Do a CPS API set
+
+def cps_set(obj, attrs={}):
+    log_id = 'cps-api'
+    log_funcname = sys._getframe().f_code.co_name
+    if cps.transaction([{'operation': 'set', 'change': cps_object.CPSObject(obj, qual='target', data=attrs).get()}]):
+        return
+    error(log_id, log_funcname, sys._getframe().f_lineno,
+          'CPS API set failed'
+          )
+    raise Cps_Exception
+
+# Do a CPS API delete
+
+def cps_delete(obj, attrs={}):
+    log_id = 'cps-api'
+    log_funcname = sys._getframe().f_code.co_name
+    if cps.transaction([{'operation': 'delete', 'change': cps_object.CPSObject(obj, qual='target', data=attrs).get()}]):
+        return
+    error(log_id, log_funcname, sys._getframe().f_lineno,
+          'CPS API delete failed'
+          )
+    raise Cps_Exception
+
+# Extract the qualifier from a CPS API key
+
+def cps_key_qual(key):
+    return ['', 'target', 'observed', 'proposed', 'realtime'][int(key.split('.')[0])]
+
+# Extract the subcategory from a CPS API key
+
+def cps_key_subcat(key):
+    return int(key.split('.')[2])
+
+# Publish a CPS API event
+
+def cps_publish(obj, attrs={}):
+    cps.event_send(cps_ev_hdl, cps_object.CPSObject(obj, data=attrs, qual='observed').get())    
+
+# Map string entity type to numeric CPS API entity type
+
+entity_type_str_to_num_dict = {"psu": 1, "fan-tray": 2, "card": 3}
+def entity_type_str_to_num(entity_type):
+    return entity_type_str_to_num_dict[entity_type]
+
+# Map numeric CPS API entity type to string entity type
+
+entity_type_num_to_str_list = ['', 'psu', 'fan-tray', 'card']
+def entity_type_num_to_str(entity_type):
+    return entity_type_num_to_str_list[entity_type]
+
+# Map numeric CPS API fan airflow to string fan airflow
+
+airflow_num_to_str_list = ['', '', 'normal', 'reverse']
+def airflow_num_to_str(airflow):
+    return airflow_num_to_str_list[airflow]
+
+# Terminate
+
+def fini(status):
+    log_id = 'fini'
+    log_funcname = sys._getframe().f_code.co_name
+    notice(log_id, log_funcname, sys._getframe().f_lineno,
+           'Terminating, exit status is {0}'.format(status)
+           )
+    sys.exit(status)
+
+# Read configuration
+
+def init_config():
+    log_id = 'init'
+    log_funcname = sys._getframe().f_code.co_name
+    parser = optparse.OptionParser()
+    parser.add_option("-f", "--file", dest="filename",
+                      default='/etc/env-tmpctl/config.json', help="Specify configuration file"
+                      )
+    (options, args) = parser.parse_args()
+    notice(log_id, log_funcname, sys._getframe().f_lineno,
+           'Reading configuration from {0}'.format(options.filename)
+           )
+    try:
+        global config
+        config = json.load(open(options.filename))
+    except:
+        error(log_id, log_funcname, sys._getframe().f_lineno,
+              'Failed to read configuration file'
+              )
+        fini(1)
+    #
+    # Save copy of fault configuration from config file, and note index of master thresholds
+    #
+    global temperature_fault_cfg_orig
+    temperature_fault_cfg_orig = copy.deepcopy(config['faults'])
+    global temperature_fault_master_thresh_idx
+    i = 0
+    for t in config['faults']:
+        if t.get('master-thresholds'):
+            temperature_fault_master_thresh_idx = i
+            break
+        i = i + 1
+    if temperature_fault_master_thresh_idx is None:
+        notice(log_id, log_funcname, sys._getframe().f_lineno,
+               'Master fault thresholds not specified in config file, defaulting to first thresholds'
+               )
+        temperature_fault_master_thresh_idx = 0
+
+# Set/clear fault
+
+def entity_fault_set_clr(entity_type, slot, fault, set_clr):
+    log_id       = 'entity'
+    log_funcname = sys._getframe().f_code.co_name
+    k = (entity_type, slot)
+    trace(log_id, log_funcname, sys._getframe().f_lineno,
+          '{0} fault for entity {1}'.format('Setting' if set_clr else 'Clearing', k)
+          )
+    if set_clr:
+        #
+        # Set fault
+        #
+        if k not in entity_faults:
+            entity_faults[k] = set()
+        if fault not in entity_faults[k]:
+            # Raise fault
+            notice(log_id, log_funcname, sys._getframe().f_lineno,
+                   'Entity fault set: entity={0}, fault="{1}"'.format(k, fault)
+                   )
+            entity_faults[k].add(fault)
+    else:
+        #
+        # Clear fault
+        #
+        if k in entity_faults and fault in entity_faults[k]:
+            # Clear fault
+            notice(log_id, log_funcname, sys._getframe().f_lineno,
+                   'Entity fault cleared: entity={0}, fault="{1}"'.format(k, fault)
+                   )
+            entity_faults[k].remove(fault)
+
+# Clear all faults for entity
+
+def entity_faults_clr_all(entity_type, slot):
+    log_id       = 'entity'
+    log_funcname = sys._getframe().f_code.co_name
+    k = (entity_type, slot)
+    trace(log_id, log_funcname, sys._getframe().f_lineno,
+          'Clearing all faults for entity {0}'.format(k)
+          )
+    if k not in entity_faults:
+        return
+    for f in list(entity_faults[k]):
+        entity_fault_set_clr(entity_type, slot, f, False)
+
+# Check validity of airflow for entity, raise airflow fault if incorrect, update overall airflow
+
+def airflow_chk(entity_type, slot, airflow):
+    log_id = 'airflow'
+    log_funcname = sys._getframe().f_code.co_name
+    trace(log_id, log_funcname, sys._getframe().f_lineno,
+          'Checking airflow ({0}) for entity {1}'.format(airflow, (entity_type, slot))
+          )
+    global airflow_current
+    if airflow_configured is not None:
+        #
+        # Airflow specified in config file
+        #
+        trace(log_id, log_funcname, sys._getframe().f_lineno,
+              'Airflow specified in config file'
+              )
+        if airflow == airflow_configured:
+            #
+            # Entity airflow matches configured airflow => Accept
+            #
+            trace(log_id, log_funcname, sys._getframe().f_lineno,
+                  'Entity airflow matches config file'
+                  )
+            return
+    else:
+        #
+        # Airflow not specified in config file
+        #
+        trace(log_id, log_funcname, sys._getframe().f_lineno,
+              'No airflow specified in config file; current airflow is {0}'.format(airflow_current)
+              )
+        if airflow_current is None:
+            #
+            # First entity installed having airflow => Make airflow of system same as airflow of this entity, and accept
+            #
+            trace(log_id, log_funcname, sys._getframe().f_lineno,
+                  'Using entity airflow as defining airflow'
+                  )
+            airflow_current = airflow
+            return
+        if airflow == airflow_current:
+            #
+            # Entity has same airflow as learned system airflow => Accecpt
+            #
+            trace(log_id, log_funcname, sys._getframe().f_lineno,
+                  'Entity airflow matches current airflow'
+                  )
+            return
+    #
+    # Entity airflow does not match config file or current learned airflow => Raise fault
+    #
+    entity_fault_set_clr(entity_type, slot, 'airflow-mismatch', True)
+
+# Revert overall airflow to 'unknown', if no entity airflow info
+
+def airflow_revert():
+    log_id = 'airflow'
+    log_funcname = sys._getframe().f_code.co_name
+    trace(log_id, log_funcname, sys._getframe().f_lineno,
+          'Reverting airflow'
+          )
+    global airflow_current
+    for v in entity_info.values():
+        if v.get('airflow', None) is not None:
+            #
+            # At least one entity specifies an airflow => Leave current learned airflow as is
+            #
+            trace(log_id, log_funcname, sys._getframe().f_lineno,
+                  'Airflow specified by entity(s), remaining at {0}'.format(airflow_current)
+                  )
+            return
+    #
+    # No entity specifies an airflow => Set current learned airflow to "unknown"
+    #
+    airflow_current = None
+    trace(log_id, log_funcname, sys._getframe().f_lineno,
+          'Airflow not specified by entities, current airflow now {0}'.format(airflow_current)
+          )
+
+# Update the level of a sensor in a sensor-level set
+
+def sensor_level_set_add(s, entity_type, slot, sensor, level, direction):
+    log_id = 'sensor'
+    log_funcname = sys._getframe().f_code.co_name
+    k = (entity_type, slot)
+    if k not in s:
+        s[k] = {}
+    if direction == 'lo' and sensor in s[k] and level > s[k][sensor]:
+        trace(log_id, log_funcname, sys._getframe().f_lineno,
+              'Overlapping thresholds, ignoring moving down to a higher level for entity {0} sensor {1} level {2} direction {3} current_level {4}'
+              .format(k, sensor, level, direction, s[k][sensor])
+              )
+        return
+    s[k][sensor] = level
+
+# Delete level information for all sensors on entity from a sensor-level set
+
+def sensor_level_set_entity_delete(s, entity_type, slot):
+    k = (entity_type, slot)
+    if k in s:
+        del s[k]
+
+# Return current level for sensor in sensor-level set
+
+def sensor_level_set_get(s, entity_type, slot, sensor):
+    k = (entity_type, slot)
+    return None if k not in s or sensor not in s[k] else s[k][sensor]
+
+# Return maximum level of a sensor-level set
+
+def sensor_level_set_max(s, dflt):
+    return max(map(lambda x: max(x.values()), s.values())) if len(s) > 0 else dflt
+
+# Validate the PPID of an entity
+
+def entity_ppid_chk(entity_type, slot):
+    log_id = 'entity'
+    log_funcname = sys._getframe().f_code.co_name
+    result = False
+    k = (entity_type, slot)
+    #
+    # Get PPID and record for entity
+    #
+    trace(log_id, log_funcname, sys._getframe().f_lineno,
+          'Getting PPID for entity {0}'.format(k)
+          )
+    resp = cps_get('base-pas/entity', {'entity-type': entity_type_str_to_num(entity_type), 'slot': slot})
+    ppid = cps_attr_data_get(resp[0], 'base-pas/entity/ppid') 
+    trace(log_id, log_funcname, sys._getframe().f_lineno,
+          'PPID = {0}'.format(ppid)
+          )
+    entity_info[k]['ppid'] = ppid
+    if ppid is None:
+        #
+        # Failed to get entity PPID => Reject entity
+        #
+        error(log_id, log_funcname, sys._getframe().f_lineno,
+              'Could not determine PPID for entity {0}, rejecting'.format(k)
+              )
+    elif ('cooling' not in config
+          or 'ppids' not in config['cooling']
+          or entity_type not in config['cooling']['ppids']
+          ):
+        #
+        # PPID for entity type not specified in config file => Accept entity
+        #
+        trace(log_id, log_funcname, sys._getframe().f_lineno,
+              'PPID not specified in config, accepting'
+              )
+        result = True
+    else:
+        #
+        # PPID for entity type given in config file => Match gotten PPID against regexp given in config file
+        #
+        result = (re.match(config['cooling']['ppids'][entity_type], ppid) is not None)
+        trace(log_id, log_funcname, sys._getframe().f_lineno,
+              'Reported PPID {0}'.format('valid' if result else 'not valid')
+              )
+    if not result:
+        #
+        # Entity rejected => Raise fault
+        #
+        entity_fault_set_clr(entity_type, slot, 'invalid-ppid', True)
+    return result
+
+# Set or clear fan fault
+
+def fan_fault_set_clr(entity_type, slot, fan_idx, set_clr):
+    if set_clr:
+        fan_faults.add((entity_type, slot, fan_idx))
+    else:
+        for f in list(fan_faults):
+            if not ((entity_type is None or f[0] == entity_type)
+                    and (slot is None or f[1] == slot)
+                    and (fan_idx is None or f[2] == fan_idx)
+                    ):
+                continue
+            fan_faults.remove(f)
+
+# Check if any fan faults outstanding
+
+def fan_fault():
+    return len(fan_faults) != 0
+
+# Update all attributes for entity
+
+def entity_info_update(entity_type, slot):
+    log_id = 'entity'
+    log_funcname = sys._getframe().f_code.co_name
+    k = (entity_type, slot)
+    et = entity_type_str_to_num(entity_type)
+    ei = entity_info[k]
+    trace(log_id, log_funcname, sys._getframe().f_lineno,
+          'Updating all attributes for entity {0}'.format(k)
+          )
+    #
+    # Get all temperature sensors for entity
+    #
+    ei['sensors'] = []
+    resp = cps_get('base-pas/temperature', {'entity-type': et, 'slot': slot})
+    for r in resp:
+        s = cps_attr_data_get(r, 'base-pas/temperature/name')
+        if s is None:
+            error(log_id, log_funcname, sys._getframe().f_lineno,
+                  'Could not get temperature sensor name for entity {0}'.format(k)
+                  )
+        else:
+            ei['sensors'].append(s)
+    trace(log_id, log_funcname, sys._getframe().f_lineno,
+          'Entity {0} sensors are {1}'.format(k, ei['sensors'])
+          )
+    #
+    # Count number of fans for entity, and query fan fault state
+    #
+    resp = cps_get('base-pas/fan', {'entity-type': et, 'slot': slot})
+    num_fans = len(resp)
+    for r in resp:
+        fan_idx     = cps_attr_data_get(r, 'base-pas/fan/fan-index')
+        oper_status = cps_attr_data_get(r, 'base-pas/fan/oper-status')
+        if fan_idx is None or oper_status is None:
+            error(log_id, log_funcname, sys._getframe().f_lineno,
+                  'Could not get fan status for entity {0} fan {1}'
+                  .format(k, fan_idx)
+                  )
+        else:
+            fan_fault_set_clr(entity_type, slot, fan_idx, oper_status != 1)
+    ei['num-fans'] = num_fans
+    trace(log_id, log_funcname, sys._getframe().f_lineno,
+          'Entity {0} number of fans is {1}'.format(k, ei['num-fans'])
+          )
+    if num_fans == 0:
+        return
+    #
+    # Entity has fans => Get airflow for fans
+    #
+    subcat = 'base-pas/' + entity_type
+    resp = cps_get(subcat, {'slot': slot})
+    airflow = cps_attr_data_get(resp[0], subcat + '/fan-airflow-type')
+    if airflow is None:
+        error(log_id, log_funcname, sys._getframe().f_lineno,
+              'Could not get airflow for {0} slot {1}'.format(entity_type, slot)
+              )
+    else:
+        airflow = airflow_num_to_str(airflow)
+    ei['airflow'] = airflow
+    trace(log_id, log_funcname, sys._getframe().f_lineno,
+          'Entity {0} airflow is {1}'.format(k, ei['airflow'])
+          )
+    #
+    # Validate airflow of fans
+    #
+    if airflow is not None:
+        airflow_chk(entity_type, slot, airflow)
+
+# Check if any fan tray not installed
+
+def fan_tray_absent():
+    for e in entity_info.items():
+        if e[0][0] == 'fan-tray' and e[1]['present'] == 0:
+            return True
+    return False
+
+# Delete all attributes for an entity
+
+def entity_info_delete(entity_type, slot):
+    log_id = 'entity'
+    log_funcname = sys._getframe().f_code.co_name
+    k = (entity_type, slot)
+    ei = entity_info[k]
+    trace(log_id, log_funcname, sys._getframe().f_lineno,
+          'Deleting all entity info for entity {0}'.format(k)
+          )
+    had_fans = (ei.get('num-fans', 0) > 0)
+    #
+    # Mark entity absent, discard all other information about entity
+    #
+    entity_info[k] = { 'present': 0 }
+    if had_fans:
+        #
+        # Entity had fans
+        # => Clear any fan faults for entity
+        #    Check if learned airflow needs to be updated
+        #
+        fan_fault_set_clr(entity_type, slot, None, False)
+        airflow_revert()
+
+# Enable/disable all temperature thresholds for an entity
+
+def thresh_en_dis(entity_type, slot, en_dis):
+    cps_set('base-pas/temperature',
+            {'entity-type': entity_type_str_to_num(entity_type),
+             'slot': slot,
+             'thresh-enable': en_dis
+             }
+            )
+
+# Delete all temperature thresholds for an entity
+
+def thresh_delete(entity_type, slot):
+    cps_delete('base-pas/temp_threshold',
+               {'entity-type': entity_type_str_to_num(entity_type),
+                'slot': slot
+                }
+               )
+
+# Set a temperature threshold for a sensor
+
+def thresh_set(entity_type, slot, sensor, thresh_idx, hi, lo):
+    log_id = 'temperature'
+    log_funcname = sys._getframe().f_code.co_name
+    trace(log_id, log_funcname, sys._getframe().f_lineno,
+          'Setting threshold for entity={0} sensor="{1}" thresh_idx={2} hi={3} lo={4}'
+          .format((entity_type, slot), sensor, thresh_idx, hi, lo)
+          )
+    cps_set('base-pas/temp_threshold',
+            {'entity-type': entity_type_str_to_num(entity_type),
+             'slot': slot,
+             'name': sensor,
+             'threshold-index': thresh_idx,
+             'hi': hi,
+             'lo': lo
+             }
+            )
+
+# Set all temperature thresholds for an entity
+
+def entity_thresholds_set(entity_type, slot):
+    log_id = 'temperature'
+    log_funcname = sys._getframe().f_code.co_name
+    k = (entity_type, slot)
+    if 'cooling' not in config or 'thresholds' not in config['cooling']:
+        trace(log_id, log_funcname, sys._getframe().f_lineno,
+              'No cooling config, skipping setting thresholds for entity {0}'
+              .format(k)
+              )
+        return
+    trace(log_id, log_funcname, sys._getframe().f_lineno,
+          'Setting thresholds for entity {0}'.format(k)
+          )
+    #
+    # Disable temperature threshold crossing detection and delete all thresholds for
+    # all sensors on entity
+    #
+    thresh_en_dis(entity_type, slot, False)
+    thresh_delete(entity_type, slot)
+    #
+    # For each sensor on entity, ...
+    #
+    for s in entity_info[k]['sensors']:
+        thresh_idx = 0
+        #
+        # Set cooling threshold(s) from config file, if any
+        #
+        for t in config['cooling']['thresholds']:
+            if not (('entity-type' not in t or t['entity-type'] == entity_type)
+                    and ('slot' not in t or t['slot'] == slot)
+                    and ('sensor' not in t or t['sensor'] == s)
+                   ):
+                continue
+            thresh_idx = thresh_idx + 1
+            thresh_set(entity_type, slot, s, thresh_idx,
+                       t['temperature']['hi'], t['temperature']['lo']
+                       )
+        #
+        # Set fault thresholds
+        #
+        for ss in config['faults']:
+            if not (('entity-type' not in ss or ss['entity-type'] == entity_type)
+                    and ('slot' not in ss or ss['slot'] == slot)
+                    and ('sensor' not in ss or ss['sensor'] == s)
+                    and ('airflow' not in ss or ss['airflow'] == airflow_current)
+                    ):
+                continue
+            for t in ss['thresholds']:
+                #
+                # Set sensor threshold
+                #
+                thresh_idx = thresh_idx + 1
+                thresh_set(entity_type, slot, s, thresh_idx, t['hi'], t['lo'])
+            break
+    #
+    # Enable temperature threshold crossing detection for all sensors
+    # on entity
+    #
+    thresh_en_dis(entity_type, slot, True)
+
+# Set thresholds for all entities
+
+def entities_all_thresholds_set():
+    for e in entity_info.items():
+        if len(e[1].get('sensors', [])) > 0:
+            entity_thresholds_set(e[0][0], e[0][1])
+
+# Set fan speed(s)
+
+def fan_speed_set(zone, speed_spec):
+    log_id = 'fan'
+    log_funcname = sys._getframe().f_code.co_name
+    entity_type = speed_spec.get('entity-type')
+    slot        = speed_spec.get('slot')
+    ppid        = speed_spec.get('ppid')
+    airflow     = speed_spec.get('airflow')
+    fan_idx     = speed_spec.get('fan-index')
+    speed       = speed_spec.get('speed')
+    speed_pct   = speed_spec.get('speed-pct')
+    #
+    # For each entity, ...
+    #
+    for e in entity_info.items():
+        #
+        # Check if matches given fan speed spec
+        #
+        if not (e[1].get('num-fans', 0) > 0
+                and (entity_type is None or e[0][0] == entity_type)
+                and (slot is None or e[0][1] == slot)
+                and (ppid is None or re.match(ppid, e[1]['ppid']) is not None)
+                and (airflow is None or e[1]['airflow'] == airflow)
+                ):
+            continue
+        notice(log_id, log_funcname, sys._getframe().f_lineno,
+               'Setting fan speed(s): zone={0}, entity={1}, fan_idx={2}, speed={3}, speed_pct={4}'
+               .format(zone, e[0], fan_idx, speed, speed_pct)
+               )
+        #
+        # Set fan speed
+        #
+        attrs = {'entity-type': entity_type_str_to_num(e[0][0]), 'slot': e[0][1]}
+        if fan_idx is not None:
+            attrs['fan-index'] = fan_idx
+        if speed is not None:
+            attrs['speed'] = speed
+        if speed_pct is not None:
+            attrs['speed_pct'] = speed_pct
+        cps_set('base-pas/fan', attrs)
+
+# Set all fan speeds for the given zone
+
+def zone_fan_speeds_set(zone):
+    log_id = 'fan'
+    log_funcname = sys._getframe().f_code.co_name
+    if 'cooling' not in config or 'levels' not in config['cooling']:
+        trace(log_id, log_funcname, sys._getframe().f_lineno,
+              'No cooling config, skipping fan speed set'
+              )
+        return
+    trace(log_id, log_funcname, sys._getframe().f_lineno,
+          'Setting fan speed(s) for zone {0}'.format(zone)
+          )
+    trace(log_id, log_funcname, sys._getframe().f_lineno,
+          'Zone sensor levels = {0}'.format(zone_sensor_levels.get(zone))
+          )
+    #
+    # Determine maximum level for zone, from config file
+    #
+    max_level = len(config['cooling']['levels'][zone]) - 1
+    trace(log_id, log_funcname, sys._getframe().f_lineno,
+          'Max level in config file = {0}'.format(max_level)
+          )
+    if fan_fault() and 'fault-full-speed' in config['cooling'].get('options', []):
+        #
+        # At least one fan is faulty, and config files specifies that all fans should be set
+        # to maximum speed when any fan is faulty => Use maximum level for zone
+        #
+        trace(log_id, log_funcname, sys._getframe().f_lineno,
+              'One or more fans faulty, using max level from config file'
+              )
+        level = max_level
+    elif fan_tray_absent() and 'absent-full-speed' in config['cooling'].get('options', []):
+        #
+        # At least one fan tray is absent, and config files specifies that all fans should be set
+        # to maximum speed when any fan tray is absent => Use maximum level for zone
+        #
+        trace(log_id, log_funcname, sys._getframe().f_lineno,
+              'One or more fan trays are absent, using max level from config file'
+              )
+        level = max_level
+    elif zone in zone_sensor_levels:
+        #
+        # Sensors have reported for zone => Determine maximum reporting level for zone
+        #
+        level = sensor_level_set_max(zone_sensor_levels[zone], max_level)
+        trace(log_id, log_funcname, sys._getframe().f_lineno,
+              'Max level of sensors = {0}'.format(level)
+              )
+        if level > max_level:
+            #
+            # Max reporting level of sensors exceeds maximum level in config gile =>
+            # Use maximum level from config file
+            #
+            error(log_id, log_funcname, sys._getframe().f_lineno,
+                  'Max sensor level of {0} for zone {1} exceeds configured levels, using max configured level of {2}'
+                  .format(level, zone, max_level)
+                  )
+            level = max_level
+    else:
+        #
+        # No sensors have reported for zone yet => Use max level from config file
+        #
+        trace(log_id, log_funcname, sys._getframe().f_lineno,
+              'No sensor reporting in zone, using max level from config file'
+              )
+        level = max_level
+    notice(log_id, log_funcname, sys._getframe().f_lineno,
+           'Zone {0} at level {1}'.format(zone, level)
+           )
+    #
+    # Set fan speeds for zone
+    #
+    for s in config['cooling']['levels'][zone][level]:
+        fan_speed_set(zone, s)
+
+# Set all fan speeds for all zones
+
+def zones_all_fan_speeds_set():
+    log_id = 'fan'
+    log_funcname = sys._getframe().f_code.co_name
+    if 'cooling' not in config or 'levels' not in config['cooling']:
+        trace(log_id, log_funcname, sys._getframe().f_lineno,
+              'No cooling config, skipping setting fan speeds'
+              )
+        return
+    trace(log_id, log_funcname, sys._getframe().f_lineno,
+          'Setting fan speeds for all zones'
+          )
+    #
+    # For each zone specified in config file, set fans speeds
+    #
+    for z in config['cooling']['levels']:
+        zone_fan_speeds_set(z)
+
+# Set level of sensor in given zone
+
+def zone_sensor_level_set(zone, entity_type, slot, sensor, temperature, level, direction):
+    log_id = 'fan'
+    log_funcname = sys._getframe().f_code.co_name
+    notice(log_id, log_funcname, sys._getframe().f_lineno,
+           'Zone {0} entity {1} sensor "{2}" temperature {3} level {4}'
+           .format(zone, (entity_type, slot), sensor, temperature, level)
+           )
+    if zone not in config['cooling']['levels']:
+        #
+        # No levels configured for zone
+        #
+        error(log_id, log_funcname, sys._getframe().f_lineno,
+              'Setting level for unconfigured zone {0}'.format(zone)
+              )
+    if zone not in zone_sensor_levels:
+        zone_sensor_levels[zone] = {}
+    sensor_level_set_add(zone_sensor_levels[zone], entity_type, slot, sensor, level, direction)
+
+# Delete zone level information for all sensors on entity
+
+def zone_sensors_delete(entity_type, slot):
+    log_id = 'fan'
+    log_funcname = sys._getframe().f_code.co_name
+    trace(log_id, log_funcname, sys._getframe().f_lineno,
+          'Deleting zone sensor levels for entity {0}'.format((entity_type, slot))
+          )
+    #
+    # Delete all recorded levels for all sensors on given entity in all zone
+    #
+    for v in zone_sensor_levels.values():
+        sensor_level_set_entity_delete(v, entity_type, slot)
+
+# Send a temperature fault notification
+
+fault_nominal  = 1
+fault_warning  = 6
+fault_minor    = 5
+fault_major    = 4
+fault_critical = 3
+fault_types = [fault_nominal, fault_warning, fault_minor, fault_major, fault_critical]
+
+def temperature_fault_notify(entity_type, slot, sensor, temperature, level):
+    log_id = 'fault'
+    log_funcname = sys._getframe().f_code.co_name
+    fault_type = fault_types[level]
+    trace(log_id, log_funcname, sys._getframe().f_lineno,
+          'Publishing fault event, entity={0}, sensor={1} temperature={2} fault-type={3}'
+          .format((entity_type, slot), sensor, temperature, fault_type)
+          )
+    cps_publish('base-env-tempctl/fault',
+                {'entity-type': entity_type_str_to_num(entity_type),
+                 'slot':        slot,
+                 'sensor-name': sensor,
+                 'temperature': temperature,
+                 'fault-type':  fault_type
+                 }
+                )
+
+# Set fault level for sensor
+
+def temperature_fault_sensor_level_set(entity_type, slot, sensor, temperature, level, direction):
+    log_id = 'fault'
+    log_funcname = sys._getframe().f_code.co_name
+    notice(log_id, log_funcname, sys._getframe().f_lineno,
+           'Temperature fault entity={0}, sensor="{1}", temperature={2}, level={3}'
+           .format((entity_type, slot), sensor, temperature, level)
+           )
+    notify = (level != sensor_level_set_get(temperature_fault_sensor_levels, entity_type, slot, sensor))
+    sensor_level_set_add(temperature_fault_sensor_levels, entity_type, slot, sensor, level, direction)
+    if notify:
+        temperature_fault_notify(entity_type, slot, sensor, temperature, level)
+
+# Delete fault information for all entity sensors
+
+def temperature_fault_sensors_delete(entity_type, slot):
+    log_id = 'fault'
+    log_funcname = sys._getframe().f_code.co_name
+    trace(log_id, log_funcname, sys._getframe().f_lineno,
+          'Deleting fault sensor level, entity={0}'.format((entity_type, slot))
+          )
+    sensor_level_set_entity_delete(temperature_fault_sensor_levels, entity_type, slot)
+
+# Process an entity removed
+
+def entity_absent(entity_type, slot):
+    k = (entity_type, slot)
+    if k not in entity_info:
+        entity_info[k] = { 'present': 0 }
+    ei = entity_info[k]
+    if ei['present'] == 0:
+        return
+    if len(ei.get('sensors', [])) > 0:
+        #
+        # Entity had temperature sensors => Delete entity's sensors from recorded
+        # cooling and fault sensor state
+        #
+        zone_sensors_delete(entity_type, slot)
+        temperature_fault_sensors_delete(entity_type, slot)
+    entity_faults_clr_all(entity_type, slot)
+    entity_info_delete(entity_type, slot)
+
+# Process an entity inserted
+
+def entity_present(entity_type, slot):
+    log_id = 'entity'
+    log_funcname = sys._getframe().f_code.co_name
+    k = (entity_type, slot)
+    if entity_info.get(k, {}).get('present', 0) != 0:
+        #
+        # Entity already known as present => Treat as entity absent followed by entity present,
+        # to re-learn everything about entity.
+        # (This case can occur when PAS restarts while this application is running.)
+        #
+        trace(log_id, log_funcname, sys._getframe().f_lineno,
+              'Forgetting entity {0}'.format((entity_type, slot))
+              )
+        entity_absent(entity_type, slot)
+    entity_info[k] = { 'present': 1 }
+    if not entity_ppid_chk(entity_type, slot):
+        return
+    entity_info_update(entity_type, slot)
+    if len(entity_info[k]['sensors']) > 0:
+        #
+        # N.B.  Entity present isn't really the proper signal to program thresholds,
+        # should be the registration for ownership of threshold object
+        #
+        entity_thresholds_set(entity_type, slot)
+
+# Process a temperature threshold crossing, for cooling (fan speeds)
+
+threshold_crossed_none = -9999
+
+def cooling_threshold_event(entity_type, slot, sensor, temperature, last_thresh_crossed):
+    log_id = 'temperature'
+    log_funcname = sys._getframe().f_code.co_name
+    if ('cooling' not in config
+        or 'levels' not in config['cooling']
+        or 'thresholds' not in config['cooling']
+        ):
+        trace(log_id, log_funcname, sys._getframe().f_lineno,
+              'No cooling config, skipping cooling threshold processing'
+              )
+        return
+    trace(log_id, log_funcname, sys._getframe().f_lineno,
+          'Checking cooling thresholds'
+          )
+    if last_thresh_crossed == threshold_crossed_none:
+        #
+        # Initial event for sensor reporting it is below any configured threshold
+        # => Record as reporting level 0 in all zones
+        # 
+        for z in config['cooling']['levels'].keys():
+            zone_sensor_level_set(z, entity_type, slot, sensor, temperature, 0, 'hi')
+        return
+    direction = 'hi' if temperature >= last_thresh_crossed else 'lo'
+    zone_levels = {}
+    for t in config['cooling']['thresholds']:
+        if not (('entity-type' not in t or t['entity-type'] == entity_type)
+                and ('slot' not in t or t['slot'] == slot)
+                and ('sensor' not in t or t['sensor'] == sensor)
+                and (direction == 'hi' and temperature >= t['temperature']['hi']
+                     or direction == 'lo' and temperature < t['temperature']['lo']
+                     )
+                ):
+            continue
+        #
+        # Sensor matches configured threshold spec => Set configured level
+        # in each configured zone
+        #
+        for lvl in t['level']:
+            z = lvl['zone']
+            zl = lvl[direction]
+            if zl < 0:
+                error(log_id, log_funcname, sys._getframe().f_lineno,
+                      'Attempt to set zone level less than 0, entity={0}, slot={1}, sensor={2}, temperature={3}, direction={4}'
+                      .format((entity_type, slot), sensor, temperature, direction)
+                      )
+                continue
+            if z not in zone_levels or direction == 'hi' and zl > zone_levels[z] or direction == 'lo' and zl < zone_levels[z]:
+                zone_levels[z] = zl
+    for zl in zone_levels.items():
+        zone_sensor_level_set(zl[0], entity_type, slot, sensor, temperature, zl[1], direction)
+
+# Process a temperature threshold crossing, for faults
+
+def temperature_fault_threshold_event(entity_type, slot, sensor, temperature, last_thresh_crossed):
+    log_id = 'temperature'
+    log_funcname = sys._getframe().f_code.co_name
+    trace(log_id, log_funcname, sys._getframe().f_lineno,
+          'Checking temperature fault thresholds'
+          )
+    #
+    # Check if sensor part of fault reporting
+    #
+    for ss in config['faults']:
+        if not (('entity-type' not in ss or ss['entity-type'] == entity_type)
+                and ('slot' not in ss or ss['slot'] == slot)
+                and ('sensor' not in ss or ss['sensor'] == sensor)
+                and ('airflow' not in ss or ss['airflow'] == airflow_current)
+                ):
+            continue
+        #
+        # Sensor used for fault reporting
+        #
+        if last_thresh_crossed == threshold_crossed_none:
+            #
+            # Initial event for sensor reporting it is below any configured threshold
+            # => Record as reporting fault level 0
+            # 
+            direction = 'hi'
+            lvl = 0
+        else:
+            #
+            # Run through configured fault thresholds, and determine fault level
+            #
+            t = ss['thresholds']
+            n = len(t)
+            if temperature >= last_thresh_crossed:
+                direction = 'hi'
+                lvl = 0
+                for i in range(n):
+                    if temperature >= t[i]['hi']:
+                        lvl = i + 1
+            else:
+                direction = 'lo'
+                lvl = n
+                for i in range(n):
+                    j = n - 1 - i
+                    if temperature < t[j]['lo']:
+                        lvl = j
+        temperature_fault_sensor_level_set(entity_type, slot, sensor, temperature, lvl, direction)
+        break
+
+# Process an entity event
+
+def entity_event_handler(obj):
+    log_id = 'event'
+    log_funcname = sys._getframe().f_code.co_name
+    et          = cps_attr_data_get(obj, 'base-pas/entity/entity-type')
+    slot        = cps_attr_data_get(obj, 'base-pas/entity/slot')
+    present     = cps_attr_data_get(obj, 'base-pas/entity/present')
+    oper_status = cps_attr_data_get(obj, 'base-pas/entity/oper-status')
+    if et is None or slot is None or present is None or oper_status is None:
+        error(log_id, log_funcname, sys._getframe().f_lineno,
+              'Malformed entity event, ignoring'
+              )
+        return False
+    entity_type = entity_type_num_to_str(et)
+    k = (entity_type, slot)
+    trace(log_id, log_funcname, sys._getframe().f_lineno,
+          'Got entity event: entity={0}, present={1}, oper-status={2}'.format(k, present, oper_status)
+          )
+    if present == 0:
+        #
+        # Entity reporting as absent
+        #
+        notice(log_id, log_funcname, sys._getframe().f_lineno,
+               'Entity {0} absent'.format(k)
+               )
+        entity_absent(entity_type, slot)
+    elif oper_status != 1:
+        #
+        # Entity reporting as faulty
+        #
+        notice(log_id, log_funcname, sys._getframe().f_lineno,
+               'Entity {0} faulty, oper-status={1}, fault-type={2}'
+               .format(k, oper_status, cps_attr_data_get(obj, 'base-pas/entity/fault-type'))
+               )
+    else:
+        #
+        # Entity reporting as present
+        #
+        notice(log_id, log_funcname, sys._getframe().f_lineno,
+               'Entity {0} present'.format(k)
+               )
+        entity_present(entity_type, slot)
+    return True
+
+# Process a temperature event
+
+def temperature_event_handler(obj):
+    log_id = 'event'
+    log_funcname = sys._getframe().f_code.co_name
+    result = False
+    et          = cps_attr_data_get(obj, 'base-pas/temperature/entity-type')
+    slot        = cps_attr_data_get(obj, 'base-pas/temperature/slot')
+    sensor      = cps_attr_data_get(obj, 'base-pas/temperature/name')
+    oper_status = cps_attr_data_get(obj, 'base-pas/temperature/oper-status')
+    temperature = cps_attr_data_get(obj, 'base-pas/temperature/temperature')
+    last_thresh = cps_attr_data_get(obj, 'base-pas/temperature/last-thresh')
+    if et is None or slot is None or sensor is None or oper_status is None or temperature is None or last_thresh is None:
+        error(log_id, log_funcname, sys._getframe().f_lineno,
+              'Malformed temperature event, ignoring'
+              )
+        return False
+    entity_type = entity_type_num_to_str(et)
+    k           = (entity_type, slot)
+    if k not in entity_info or len(entity_info[k].get('sensors', [])) == 0:
+        #
+        # Event for unknown sensor
+        #
+        error(log_id, log_funcname, sys._getframe().f_lineno,
+              'Spurious temperature event for entity {0}'.format(k)
+              )
+        return False
+    trace(log_id, log_funcname, sys._getframe().f_lineno,
+          'Got temperature event: entity={0}, sensor="{1}", oper_status={2}, temperature={3}, last_threshold={4}'
+          .format(k, sensor, oper_status, temperature, last_thresh)
+          )
+    if oper_status != 1:
+        #
+        # Sensor reporting as faulty
+        #
+        notice(log_id, log_funcname, sys._getframe().f_lineno,
+               'Entity {0} sensor "{1}" faulty, oper-status={2}, fault-type={3}'
+               .format(k, sensor, oper_status, cps_attr_data_get(obj, 'base-pas/temperature/fault-type'))
+               )
+    else:
+        #
+        # Sensor reporting threshold crossing => Update fan speeds and fault level
+        #
+        notice(log_id, log_funcname, sys._getframe().f_lineno,
+               'Entity {0} sensor "{1}" temperature {2}'
+               .format(k, sensor, temperature)
+               )
+        cooling_threshold_event(entity_type, slot, sensor, temperature, last_thresh)
+        temperature_fault_threshold_event(entity_type, slot, sensor, temperature, last_thresh)
+        result = True
+    return result
+
+# Process a fan event
+
+def fan_event_handler(obj):
+    log_id = 'event'
+    log_funcname = sys._getframe().f_code.co_name
+    et          = cps_attr_data_get(obj, 'base-pas/fan/entity-type')
+    slot        = cps_attr_data_get(obj, 'base-pas/fan/slot')
+    fan_idx     = cps_attr_data_get(obj, 'base-pas/fan/fan-index')
+    oper_status = cps_attr_data_get(obj, 'base-pas/fan/oper-status')
+    if et is None or slot is None or fan_idx is None or oper_status is None:
+        error(log_id, log_funcname, sys._getframe().f_lineno,
+              'Malformed fan event, ignoring'
+              )
+        return False
+    entity_type = entity_type_num_to_str(et)
+    k           = (entity_type, slot)
+    if k not in entity_info or entity_info[k].get('num-fans', 0) == 0:
+        #
+        # No known fans on entity
+        #
+        error(log_id, log_funcname, sys._getframe().f_lineno,
+              'Spurious fan event for entity {0}'.format(k)
+              )
+        return False
+    trace(log_id, log_funcname, sys._getframe().f_lineno,
+          'Got fan event: entity={0}, fan-index={1}, oper_status={2}'
+          .format(k, fan_idx, oper_status)
+          )
+    fan_fault_set_clr(entity_type, slot, fan_idx, oper_status != 1)
+    return True
+    
+# Process a CPS API event
+
+subcat_entity      = cps_key_subcat(cps.key_from_name('observed', 'base-pas/entity'))
+subcat_temperature = cps_key_subcat(cps.key_from_name('observed', 'base-pas/temperature'))
+subcat_fan         = cps_key_subcat(cps.key_from_name('observed', 'base-pas/fan'))
+
+def event_handler(obj):
+    log_id = 'event'
+    log_funcname = sys._getframe().f_code.co_name
+    update = False
+    subcat = cps_key_subcat(obj['key'])
+    if subcat == subcat_entity:
+        update = entity_event_handler(obj)
+    elif subcat == subcat_temperature:
+        update = temperature_event_handler(obj)
+    elif subcat == subcat_fan:
+        update = fan_event_handler(obj)
+    else:
+        error(log_id, log_funcname, sys._getframe().f_lineno,
+              'Received CPS API event for unexpected subcategory ({0})'.format(subcat)
+              )
+    if update:
+        zones_all_fan_speeds_set()
+
+# Connect to CPS API event service
+
+def init_events():
+    global cps_ev_hdl
+    cps_ev_hdl = cps.event_connect()
+    for subcat in ['entity', 'temperature', 'fan']:
+        cps.event_register(cps_ev_hdl, cps.key_from_name('observed', 'base-pas/' + subcat))
+
+# Wait for CPS API event, process it
+
+def process_events():
+    while True:
+        obj = cps.event_wait(cps_ev_hdl)
+        mutex.acquire()
+        try:
+            event_handler(obj)
+        except Cps_Exception:
+            # N.B.  Holding the mutex is intentional
+            return
+        mutex.release()
+
+# Query all entities, and set initial entity configuration and state
+
+def init_hw():
+    log_id = 'init'
+    log_funcname = sys._getframe().f_code.co_name
+    notice(log_id, log_funcname, sys._getframe().f_lineno, 'Probing hardware')
+    try:
+        #
+        # Determine configured airflow, if any
+        #
+        global airflow_configured
+        if 'cooling' in config and 'airflow' in config['cooling']:
+            airflow_configured = config['cooling']['airflow']
+            notice(log_id, log_funcname, sys._getframe().f_lineno,
+                   'Airflow specified in config file as {0}'.format(airflow_configured)
+                   )
+        elif 'cooling' in config and 'airflow-ppid' in config['cooling']:
+            trace(log_id, log_funcname, sys._getframe().f_lineno,
+                  'Airflow specified by PPID in config file'
+                  )
+            resp = cps_get('base-pas/chassis')
+            chassis_ppid = cps_attr_data_get(resp[0], 'base-pas/chassis/ppid')
+            if chassis_ppid is None:
+                error(log_id, log_funcname, sys._getframe().f_lineno,
+                      'Bad response to initial chassis query'
+                      )
+                return False
+            trace(log_id, log_funcname, sys._getframe().f_lineno,
+                  'Chassis PPID is {0}'.format(chassis_ppid)
+                  )
+            for r in config['cooling']['airflow-ppid']:
+                if re.match(r['ppid'], chassis_ppid) is not None:
+                    airflow_configured = r['airflow']
+                    notice(log_id, log_funcname, sys._getframe().f_lineno,
+                           'Airflow specified in config file as {0}'.format(airflow_configured)
+                           )
+                    break
+            if airflow_configured is None:
+                error(log_id, log_funcname, sys._getframe().f_lineno,
+                      'No matching PPID found, using dynamic airflow'
+                      )
+        else:
+            notice(log_id, log_funcname, sys._getframe().f_lineno,
+                   'Airflow not configured, using dynamic airflow'
+                   )
+        #
+        # Query entities
+        #
+        resp = cps_get('base-pas/entity')
+        for r in resp:
+            et = cps_attr_data_get(r, 'base-pas/entity/entity-type')
+            slot = cps_attr_data_get(r, 'base-pas/entity/slot')     
+            present = cps_attr_data_get(r, 'base-pas/entity/present')
+            if et is None or slot is None or present is None:
+                error(log_id, log_funcname, sys._getframe().f_lineno,
+                      'Bad response to initial entity query'
+                      )
+                return False
+            entity_type = entity_type_num_to_str(et)
+            if present == 0:
+                #
+                # Entity is absent
+                #
+                notice(log_id, log_funcname, sys._getframe().f_lineno,
+                       'Entity {0} not installed'.format((entity_type, slot))
+                       )
+                entity_absent(entity_type, slot)
+                continue
+            #
+            # Entity is present => Query its resources
+            #
+            notice(log_id, log_funcname, sys._getframe().f_lineno,
+                   'Entity {0} installed'.format((entity_type, slot))
+                   )
+            entity_present(entity_type, slot)
+        #
+        # Set initial fan speeds and fault level
+        #
+        zones_all_fan_speeds_set()
+        return True
+    except Cps_Exception:
+        return False
+
+# Compose response to CPS API get request for fault thresholds
+
+cps_fault_severities = { 'warning': 6, 'minor': 5, 'major': 4, 'critical': 3 }; # From YANG model
+cps_fault_sev_min = min(cps_fault_severities.values())
+cps_fault_sev_max = max(cps_fault_severities.values())
+
+def cps_fault_sev_to_idx(sev):
+    return cps_fault_sev_max - sev
+
+def cps_fault_sev_from_idx(idx):
+    return cps_fault_sev_max - idx
+
+def cps_get_fault_thresholds(params):
+    log_id = 'cps_get'
+    log_funcname = sys._getframe().f_code.co_name
+    req_obj  = params['filter']
+    q = cps_key_qual(req_obj['key'])
+    #
+    # Extract requested severity level; unspecified => all levels
+    #
+    attr = 'base-env-tempctl/fault-threshold/severity' 
+    if attr in req_obj['data']:
+        sev_start = cps_attr_data_get(req_obj, attr)
+        if sev_start < cps_fault_sev_min or sev_start > cps_fault_sev_max:
+            warning (log_id, log_funcname, sys._getframe().f_lineno,
+                     'Attempt to get fault threshold for invalid severity ({0})'
+                     .format(sev_start)
+                     )
+            return
+        sev_limit = sev_start
+    else:
+        sev_start = cps_fault_sev_min
+        sev_limit = cps_fault_sev_max
+    sev = sev_start
+    mutex.acquire()
+    #
+    # For each requested severity level, ...
+    #
+    t = config['faults'][temperature_fault_master_thresh_idx]['thresholds']
+    while sev <= sev_limit:
+        #
+        # Attach threshold for severity level to response
+        # (Note that hi threshold is used, since object model supports only single threshold)
+        #
+        params['list'].append(cps_object.CPSObject('base-env-tempctl/fault-threshold', qual=q,
+                                                   data={'severity': sev, 'threshold': t[cps_fault_sev_to_idx(sev)]['hi']}
+                                                   ).get()
+                              )
+        sev = sev + 1
+    mutex.release()
+
+# Handler for received CPS API get requests
+
+fault_threshold_subcat = cps_key_subcat(cps.key_from_name('observed', 'base-env-tempctl/fault-threshold'))
+
+def cps_get_cb(method, params):
+    log_id = 'cps_get'
+    log_funcname = sys._getframe().f_code.co_name
+    trace(log_id, log_funcname, sys._getframe().f_lineno,
+          'Got CPS API get request'
+          )
+    subcat = cps_key_subcat(params['filter']['key'])
+    if subcat == fault_threshold_subcat:
+        cps_get_fault_thresholds(params)
+    else:
+        error(log_id, log_funcname, sys._getframe().f_lineno,
+              'Received CPS API get for unexpected subcategory ({0})'.format(subcat)
+              )
+    return True
+
+# Handler to set fault thresholds
+
+def cps_set_fault_thresholds(params):
+    log_id = 'cps_set'
+    log_funcname = sys._getframe().f_code.co_name
+    req_data = params['change']
+    sev = cps_attr_data_get(req_data, 'base-env-tempctl/fault-threshold/severity')
+    if sev < cps_fault_sev_min or sev > cps_fault_sev_max:
+        warning(log_id, log_funcname, sys._getframe().f_lineno,
+                'Attempt to set fault threshold for invalid severity ({0})'
+                .format(sev)
+                )
+        return
+    thresh = cps_attr_data_get(req_data, 'base-env-tempctl/fault-threshold/threshold')
+    trace(log_id, log_funcname, sys._getframe().f_lineno,
+          'Setting fault threshold severity {0} to {1}'.format(sev, thresh)
+          )
+    sev_idx = cps_fault_sev_to_idx(sev)
+    mutex.acquire()
+    t = config['faults'][temperature_fault_master_thresh_idx]['thresholds'][sev_idx]
+    prev = params['previous']
+    #
+    # Set rollback information
+    #
+    prev['key'] = req_data['key']
+    prev['data'] = cps_object.CPSObject('base-env-tempctl/fault-threshold',
+                                        qual=cps_key_qual(req_data['key']),
+                                        data={'severity': sev, 'threshold': t['hi']}
+                                        ).get()
+    #
+    # Update configuration with new threshold
+    # (Note that both hi and lo thresholds are set, since obect model supports only single threshold)
+    #
+    t['hi'] = thresh
+    t['lo'] = thresh
+    i = 0
+    for tt in config['faults']:
+        if i != temperature_fault_master_thresh_idx:
+            scaled_thresh = ((thresh * temperature_fault_cfg_orig[i]['thresholds'][sev_idx]['hi'])
+                             / temperature_fault_cfg_orig[temperature_fault_master_thresh_idx]['thresholds'][sev_idx]['hi']
+                             )
+            tt['thresholds'][sev_idx]['hi'] = scaled_thresh
+            tt['thresholds'][sev_idx]['lo'] = scaled_thresh
+        i = i + 1
+    #
+    # Program new threshold into hardware
+    # (Note that the process of programming entity thresholds produces an immediate threshold crossing
+    # event when thresholds are re-enabled; thus, updating of the fault level per any new
+    # threshold setting is assured.)
+    #
+    try:
+        entities_all_thresholds_set()
+    except Cps_Exception:
+        pass
+    mutex.release()
+
+# Handler for received CPS API transaction requests
+
+def cps_xaction_cb(methods, params):
+    log_id = 'cps_set'
+    log_funcname = sys._getframe().f_code.co_name
+    op = params['operation']
+    if op == 'set':
+        trace(log_id, log_funcname, sys._getframe().f_lineno,
+              'Got CPS API set request'
+              )
+        subcat = cps_key_subcat(params['change']['key'])
+        if subcat == fault_threshold_subcat:
+            cps_set_fault_thresholds(params)
+        else:
+            error(log_id, log_funcname, sys._getframe().f_lineno,
+                  'Received CPS API set for unexpected subcategory ({0})'
+                  .format(subcat)
+                  )
+    else:
+        error(log_id, log_funcname, sys._getframe().f_lineno,
+              'Received CPS API transaction with unexpected operation ({0})'
+              .format(op)
+              )        
+    return True
+
+# Initialize CPS API object server handling
+
+def init_server():
+    #
+    # Register as owner of temperature fault threshold objects
+    #
+    cps.obj_register(cps.obj_init(),
+                     cps.key_from_name('target', 'base-env-tempctl'),
+                     { 'get': cps_get_cb, 'transaction': cps_xaction_cb }
+                     )
+        
+# Reset state
+
+def init_state():
+    global entity_faults, entity_info, airflow_current
+    global zone_sensor_levels, temperature_fault_level, temperature_fault_sensor_levels
+    global fan_faults
+    entity_faults = {}
+    entity_info = {}
+    airflow_current = None
+    zone_sensor_levels = {}
+    temperature_fault_level = 0
+    temperature_fault_sensor_levels = {}
+    fan_faults = set()
+
+# Mainline
+
+def main():
+    log_id = 'init'
+    log_funcname = sys._getframe().f_code.co_name
+    notice(log_id, log_funcname, sys._getframe().f_lineno, 'Starting')
+    global mutex
+    mutex = threading.Lock()
+    init_config()               # Read the config file
+    init_state()
+    init_server()               # Register for owned CPS API objects
+    init_events()               # Subscribe to CPS API events
+    while True:
+        mutex.acquire()
+        if init_hw():                   # Scan the hardware
+            mutex.release()
+            notice(log_id, log_funcname, sys._getframe().f_lineno,
+                   'Initialization completed'
+                   )
+            process_events()            # Process events as they occur
+        #
+        # Hardware probe failed or error processing event
+        # N.B.  Mutex held here; see process_events()
+        #
+        init_state()            # Chuck state, will re-probe hardware
+        mutex.release()
+        time.sleep(5)           # Pause and retry
+        notice(log_id, log_funcname, sys._getframe().f_lineno,
+               'Restarting'
+               )
+
+
+if __name__ == '__main__':
+    main()

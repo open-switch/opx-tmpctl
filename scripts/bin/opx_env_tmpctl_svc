@@ -221,7 +221,7 @@ def init_config():
     log_funcname = sys._getframe().f_code.co_name
     parser = optparse.OptionParser()
     parser.add_option("-f", "--file", dest="filename",
-                      default='/etc/env-tmpctl/config.json', help="Specify configuration file"
+                      default='/etc/opx/env-tmpctl/config.json', help="Specify configuration file"
                       )
     (options, args) = parser.parse_args()
     notice(log_id, log_funcname, sys._getframe().f_lineno,

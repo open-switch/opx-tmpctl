@@ -1,0 +1,15 @@
+[Unit]
+Description=Temperature sensing and control service
+DefaultDependencies=no
+
+[Service]
+EnvironmentFile=/etc/opx/opx-environment
+ExecStart=/usr/bin/opx_env_tmpctl_svc
+KillSignal=SIGKILL
+SuccessExitStatus=SIGKILL
+
+# Resource Limitations
+LimitCORE=infinity
+
+[Install]
+WantedBy=multi-user.target

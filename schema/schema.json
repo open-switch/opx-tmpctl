@@ -1,0 +1,247 @@
+{
+    "$schema": "http://json-schema.org/draft-04/schema#",
+    "title": "Temperature control",
+    "description": "Configuration of temperature control service",
+    "type": "object",
+    "properties": {
+        "cooling" : {
+            "description": "Cooling (fan-speed control) configuration.  Cooling configuration is specified in terms of cooling zones and zone levels.  Zones are named collections of actions, such that each zone specifies how to set fan speeds for each level in that zone.  Threshold configurations specify how to set levels for zones when temperature thresholds are crossed.",
+            "type": "object",
+            "properties" : {
+                "ppids": {
+                    "description": "Regexps for validating PPIDs for given entity types; optional, unspecied => Any PPID",
+                    "type": "object",
+                    "properties": {
+                        "psu": {
+                            "description": "Regexp to match against for valid PSU PPID",
+                            "type": "string"
+                        },
+                        "fan-tray": {
+                            "description": "Regexp to match against for valid fan tray PPID",
+                            "type": "string"
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "airflow": {
+                    "description": "All cooling devices must be of this airflow type; optional, unspecified => any airflow type",
+                    "type": "string",
+                    "enum": [ "normal", "reverse" ]
+                },
+                "airflow-ppid": {
+                    "description": "Required airflow based on chassis PPID; optional, unspecified => Chassis PPID does not determine airflow",
+                    "type": "array",
+                    "items": {
+                        "description": "List of pattern-airflow pairs",
+                        "type": "object",
+                        "properties": {
+                            "ppid": {
+                                "description": "Regexp to match against chassis PPID",
+                                "type": "string"
+                            },
+                            "airflow": {
+                                "description": "All cooling devices must be of this airflow type, if chassis PPID matches pattern",
+                                "type": "string",
+                                "enum": [ "normal", "reverse" ]
+                            }
+                        },
+                        "additionalProperties": false
+                    }
+                },
+                "options": {
+                    "description": "List of cooling options",
+                    "type": "array",
+                    "items": {
+                        "description": "Cooling option",
+                        "type": "string",
+                        "enum": [ "fault-full-speed", "absent-full-speed" ]
+                    }
+                },
+                "levels": {
+                    "description": "Cooling zones, by zone name",
+                    "type": "object",
+                    "additionalProperties": {
+                        "description": "List of cooling levels for given zone, ordered by level, starting from 0",
+                        "type": "array",
+                        "items": {
+                            "description": "List of fan speed settings for given zone and this level",
+                            "type": "array",
+                            "items": {
+                                "description": "Fan speed setting for given zone and given cooling level",
+                                "type": "object",
+                                "properties": {
+                                    "entity-type": {
+                                        "description": "Entity type for fan(s); optional, unspecified => all entity types",
+                                        "type": "string",
+                                        "enum": [ "psu", "fan-tray", "card" ]
+                                    },
+                                    "slot": {
+                                        "description": "Entity slot for fan(s); optional, unspecified => all slots",
+                                        "type": "integer",
+                                        "minimum": 1
+                                    },
+                                    "fan-index": {
+                                        "description": "Fan index for fan(s); optional, unspecified => all fans",
+                                        "type": "integer",
+                                        "minimum": 1
+                                    },
+                                    "ppid": {
+                                        "description": "Regexp to match against PPID of entity; optional, unspecified => any PPID",
+                                        "type": "string"
+                                    },
+                                    "airflow": {
+                                        "description": "Airflow for fan(s); optional, unspecified => any airflow",
+                                        "type": "string",
+                                        "enum": [ "normal", "reverse" ]
+                                    },
+                                    "speed": {
+                                        "description": "Fan speed, in RPM; exactly one of speed in RPM or percent must be specified",
+                                        "type": "integer",
+                                        "minimum": 0
+                                    },
+                                    "speed-pct": {
+                                        "description": "Fan speed, in percent of maximum speed; exactly one of speed in RPM or percent must be specified",
+                                        "type": "integer",
+                                        "minimum": 0,
+                                        "maximum": 100
+                                    }
+                                },
+                                "oneOf": [ { "required": [ "speed" ] }, { "required": [ "speed-pct" ] } ],
+                                "additionalProperties": false
+                            }
+                        }
+                    }                    
+                },
+                "thresholds": {
+                    "description": "List of temperature control thresholds, starting from 0",
+                    "type": "array",
+                    "items": {
+                        "description": "Threshold specification",
+                        "type": "object",
+                        "properties": {
+                            "entity-type": {
+                                "description": "Entity type for sensor(s); optional, unspecified => any entity type",
+                                "type": "string",
+                                "enum": [ "psu", "fan-tray", "card" ]
+                            },
+                            "slot": {
+                                "description": "Entity slot for sensor(s); optional, unspecified => any slot",
+                                "type": "integer",
+                                "minimum": 1
+                            },
+                            "sensor": {
+                                "description": "Temperature sensor name; optional, unspecified => any sensor",
+                                "type": "string"
+                            },
+                            "temperature": {
+                                "description": "Temperature thresholds",
+                                "type": "object",
+                                "properties": {
+                                    "hi": {
+                                        "description": "Positive-going temperature threshold",
+                                        "type": "integer"
+                                    },
+                                    "lo": {
+                                        "description": "Negative-going temperature threshold",
+                                        "type": "integer"
+                                    }
+                                },
+                                "required": [ "hi", "lo" ]
+                            },
+                            "level": {
+                                "description": "List of zone level specifications",
+                                "type": "array",
+                                "items": {
+                                    "description": "Zone level specification",
+                                    "type": "object",
+                                    "properties": {
+                                        "zone": {
+                                            "description": "Zone name; must be a named zone in levels specification above",
+                                            "type": "string"
+                                        },
+                                        "hi": {
+                                            "description": "Level for given zone if positive-going threshold crossed",
+                                            "type": "integer",
+                                            "minimum": 0
+                                        },
+                                        "lo": {
+                                            "description": "Level for given zone if negative-going threshold crossed",
+                                            "type": "integer",
+                                            "minimum": 0
+                                        }
+                                    },
+                                    "required": [ "zone", "hi", "lo" ]
+                                }
+                            }
+                        },
+                        "required": [ "temperature", "level" ],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "oneOf": [ { "not": { "anyOf": [ { "required": [ "levels" ] }, { "required": [ "thresholds" ] } ] } }, { "required": [ "levels", "thresholds" ] } ],
+            "additionalProperties": false
+        },
+
+        "faults": {
+            "description": "List of sensors and thresholds to use for fault level",
+            "type": "array",
+            "items": {
+                "description": "Sensor and threshold for fault level",
+                "type": "object",
+                "properties": {
+                    "entity-type": {
+                        "description": "Entity type for sensor(s); optional, unspecified => any entity type",
+                        "type": "string",
+                        "enum": [ "psu", "fan-tray", "card" ]
+                    },
+                    "slot": {
+                        "description": "Entity slot for sensor(s); optional, unspecified => any slot",
+                        "type": "integer",
+                        "minimum": 1
+                    },
+                    "sensor": {
+                        "description": "Temperature sensor name; optional, unspecified => any sensor",
+                        "type": "string"
+                    },
+                    "airflow": {
+                        "description": "Use this sensor if current airflow matches given airflow; optional, unspecified => any airflow",
+                        "type": "string",
+                        "enum": [ "normal", "reverse" ]
+                    },
+                    "thresholds": {
+                        "description": "List of fault thresholds, ordered by fault level, starting at 0.  Four thresholds must be specified, for transtioning between nominal, warning, minor, major and critical fault levels.",
+                        "type": "array",
+                        "items": {
+                            "description": "Fault threshold",
+                            "type": "object",
+                            "properties": {
+                                "hi": {
+                                    "description": "Positive-going threshold to transition to higher fault level",
+                                    "type": "integer"
+                                },
+                                "lo": {
+                                    "description": "Negative-going threshold to transition to lower fault level",
+                                    "type": "integer"
+                                }
+                            },
+                            "required": [ "hi", "lo" ],
+                            "additionalProperties": false
+                        },
+                        "minItems": 4,
+                        "maxItems": 4
+                    },
+                    "master-thresholds": {
+                        "description": "Thresholds used for CPS API fault thresholds",
+                        "type": "boolean"
+                    }
+                },
+                "required": [ "sensor", "thresholds" ],
+                "additionalProperties": false
+            },
+            "minItems": 1
+        }
+    },
+    "required": [ "faults" ],
+    "additionalProperties": false
+}

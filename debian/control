@@ -6,7 +6,7 @@ Build-Depends: debhelper (>= 9),dh-autoreconf,dh-systemd,autotools-dev
 Standards-Version: 3.9.3
 
 Package: opx-tmpctl
-Architecture: any
+Architecture: all
 Depends: ${shlibs:Depends}, ${misc:Depends},
 Description: Files common to all platforms
 

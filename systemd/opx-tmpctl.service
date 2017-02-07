@@ -1,5 +1,7 @@
 [Unit]
 Description=Temperature sensing and control service
+After=opx-cps.service
+Wants=opx-cps.service
 DefaultDependencies=no
 
 [Service]

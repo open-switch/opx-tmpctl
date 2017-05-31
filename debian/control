@@ -7,6 +7,6 @@ Standards-Version: 3.9.3
 
 Package: opx-tmpctl
 Architecture: all
-Depends: ${shlibs:Depends}, ${misc:Depends},
+Depends: ${shlibs:Depends}, ${misc:Depends}, python-opx-cps (>= 2.0.0), python-opx-logging (>= 2.0.0)
 Description: Files common to all platforms
 

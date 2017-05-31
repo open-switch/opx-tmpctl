@@ -90,6 +90,8 @@ import cps_utils
 import cps_object
 import event_log
 import time
+import signal
+import systemd.daemon
 
 log_modname  = 'ENV_TMPCTL'     # Module name, for logging
 log_filename = sys._getframe().f_code.co_filename # Filename, for logging
@@ -1161,10 +1163,10 @@ def temperature_event_handler(obj):
         result = True
     return result
 
-# Process a fan event
+# Process a fan status
 
-def fan_event_handler(obj):
-    log_id = 'event'
+def fan_fault_handler(obj):
+    log_id = 'fan'
     log_funcname = sys._getframe().f_code.co_name
     et          = cps_attr_data_get(obj, 'base-pas/fan/entity-type')
     slot        = cps_attr_data_get(obj, 'base-pas/fan/slot')
@@ -1172,24 +1174,33 @@ def fan_event_handler(obj):
     oper_status = cps_attr_data_get(obj, 'base-pas/fan/oper-status')
     if et is None or slot is None or fan_idx is None or oper_status is None:
         error(log_id, log_funcname, sys._getframe().f_lineno,
-              'Malformed fan event, ignoring'
+              'Malformed fan object, ignoring'
               )
         return False
     entity_type = entity_type_num_to_str(et)
     k           = (entity_type, slot)
+    faultf      = (oper_status != 1)
+    trace(log_id, log_funcname, sys._getframe().f_lineno,
+          'Fan fault entity {0} fan-index {1} fault {2}'
+          .format(k, fan_idx, faultf)
+          )
     if k not in entity_info or entity_info[k].get('num-fans', 0) == 0:
         #
         # No known fans on entity
         #
         error(log_id, log_funcname, sys._getframe().f_lineno,
-              'Spurious fan event for entity {0}'.format(k)
+              'Spurious fan object for entity {0}'.format(k)
               )
         return False
-    trace(log_id, log_funcname, sys._getframe().f_lineno,
-          'Got fan event: entity={0}, fan-index={1}, oper_status={2}'
-          .format(k, fan_idx, oper_status)
-          )
-    fan_fault_set_clr(entity_type, slot, fan_idx, oper_status != 1)
+    fan_fault_set_clr(entity_type, slot, fan_idx, faultf)
+
+# Process a fan event
+
+def fan_event_handler(obj):
+    log_id = 'event'
+    log_funcname = sys._getframe().f_code.co_name
+    trace(log_id, log_funcname, sys._getframe().f_lineno, 'Got fan event')
+    fan_fault_handler(obj)
     return True
     
 # Process a CPS API event
@@ -1312,6 +1323,12 @@ def init_hw():
                    'Entity {0} installed'.format((entity_type, slot))
                    )
             entity_present(entity_type, slot)
+        #
+        # Query fans
+        #
+        resp = cps_get('base-pas/fan')
+        for r in resp:
+            fan_fault_handler(r)
         #
         # Set initial fan speeds and fault level
         #
@@ -1496,18 +1513,12 @@ def init_state():
     temperature_fault_sensor_levels = {}
     fan_faults = set()
 
+def sigterm_hdlr(signum, frame):
+    global shutdown
+    shutdown = True
 # Mainline
 
 def main():
-    log_id = 'init'
-    log_funcname = sys._getframe().f_code.co_name
-    notice(log_id, log_funcname, sys._getframe().f_lineno, 'Starting')
-    global mutex
-    mutex = threading.Lock()
-    init_config()               # Read the config file
-    init_state()
-    init_server()               # Register for owned CPS API objects
-    init_events()               # Subscribe to CPS API events
     while True:
         mutex.acquire()
         if init_hw():                   # Scan the hardware
@@ -1527,6 +1538,43 @@ def main():
                'Restarting'
                )
 
+class processEventThread(threading.Thread):
+    def __init__(self, threadID, name):
+        threading.Thread.__init__(self)
+        self.threadId = threadID
+        self.name = name
+    def run(self):
+        main()
+    def __str__(self):
+        return ' %s %d ' %(self.name, self.threadID)
 
 if __name__ == '__main__':
-    main()
+    shutdown = False
+    # Install signal handlers.
+    import signal
+    signal.signal(signal.SIGTERM, sigterm_hdlr)
+
+    log_id = 'init'
+    log_funcname = sys._getframe().f_code.co_name
+    notice(log_id, log_funcname, sys._getframe().f_lineno, 'Starting')
+    global mutex
+    mutex = threading.Lock()
+    init_config()               # Read the config file
+    init_state()
+    init_server()               # Register for owned CPS API objects
+    init_events()               # Subscribe to CPS API events
+
+    process_event_thread = processEventThread(1, "Event Processing Thread")
+    process_event_thread.daemon = True
+    process_event_thread.start()
+
+    # Initialization complete
+    # Notify systemd: Daemon is ready
+    import systemd.daemon
+    systemd.daemon.notify("READY=1")
+
+    while False == shutdown:
+        signal.pause()
+    
+    systemd.daemon.notify("STOPPING=1")
+    #Cleanup code here

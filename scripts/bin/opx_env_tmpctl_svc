@@ -255,6 +255,18 @@ def init_config():
                )
         temperature_fault_master_thresh_idx = 0
 
+# Send a notification for entity faults
+
+def entity_fault_notify(entity_type, slot):
+    f = entity_faults.get((entity_type, slot), [])
+    cps_publish('base-env-tempctl/entity-fault',
+                {'entity-type': entity_type_str_to_num(entity_type),
+                 'slot': slot,
+                 'ppid': 1 if 'invalid-ppid' in f else 0,
+                 'airflow': 1 if 'airflow-mismatch' in f else 0
+                 }
+                )
+
 # Set/clear fault
 
 def entity_fault_set_clr(entity_type, slot, fault, set_clr):

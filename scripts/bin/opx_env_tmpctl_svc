@@ -288,6 +288,7 @@ def entity_fault_set_clr(entity_type, slot, fault, set_clr):
                    'Entity fault set: entity={0}, fault="{1}"'.format(k, fault)
                    )
             entity_faults[k].add(fault)
+            entity_fault_notify(entity_type, slot)
     else:
         #
         # Clear fault
@@ -298,6 +299,7 @@ def entity_fault_set_clr(entity_type, slot, fault, set_clr):
                    'Entity fault cleared: entity={0}, fault="{1}"'.format(k, fault)
                    )
             entity_faults[k].remove(fault)
+            entity_fault_notify(entity_type, slot)
 
 # Clear all faults for entity
 
@@ -1349,6 +1351,49 @@ def init_hw():
     except Cps_Exception:
         return False
 
+# Compose response to CPS API get request for outstanding temperature faults
+
+def cps_get_temp_faults(params):
+    log_id = 'cps_get'
+    log_funcname = sys._getframe().f_code.co_name
+    q = cps_key_qual(params['filter']['key'])
+    li = []
+    mutex.acquire()
+    for i in temperature_fault_sensor_levels.items():
+        for j in i[1].items():
+            li.append((i[0][0], i[0][1], j[0], j[1]))
+    mutex.release()
+    for i in li:
+        params['list'].append(cps_object.CPSObject('base-env-tempctl/fault',
+                                                   qual=q,
+                                                   data={'entity-type': entity_type_str_to_num(i[0]),
+                                                         'slot':        i[1],
+                                                         'sensor-name': i[2],
+                                                         'fault-type':  fault_types[i[3]]
+                                                         }
+                                                   ).get()
+                              )
+
+# Compose response to CPS API get request for outstanding entity faults
+
+def cps_get_entity_faults(params):
+    log_id = 'cps_get'
+    log_funcname = sys._getframe().f_code.co_name
+    q = cps_key_qual(params['filter']['key'])
+    mutex.acquire()
+    li = entity_faults.items()
+    mutex.release()
+    for i in li:
+        params['list'].append(cps_object.CPSObject('base-env-tempctl/entity-fault',
+                                                   qual=q,
+                                                   data={'entity-type': entity_type_str_to_num(i[0][0]),
+                                                         'slot':        i[0][1],
+                                                         'ppid':        1 if 'invalid-ppid' in i[1] else 0,
+                                                         'airflow':     1 if 'airflow-mismatch' in i[1] else 0
+                                                         }
+                                                   ).get()
+                              )
+
 # Compose response to CPS API get request for fault thresholds
 
 cps_fault_severities = { 'warning': 6, 'minor': 5, 'major': 4, 'critical': 3 }; # From YANG model
@@ -1402,7 +1447,9 @@ def cps_get_fault_thresholds(params):
 
 # Handler for received CPS API get requests
 
+temp_fault_subcat      = cps_key_subcat(cps.key_from_name('observed', 'base-env-tempctl/fault'))
 fault_threshold_subcat = cps_key_subcat(cps.key_from_name('observed', 'base-env-tempctl/fault-threshold'))
+entity_fault_subcat    = cps_key_subcat(cps.key_from_name('observed', 'base-env-tempctl/entity-fault'))
 
 def cps_get_cb(method, params):
     log_id = 'cps_get'
@@ -1411,8 +1458,12 @@ def cps_get_cb(method, params):
           'Got CPS API get request'
           )
     subcat = cps_key_subcat(params['filter']['key'])
-    if subcat == fault_threshold_subcat:
+    if subcat == temp_fault_subcat:
+        cps_get_temp_faults(params)
+    elif subcat == fault_threshold_subcat:
         cps_get_fault_thresholds(params)
+    elif subcat == entity_fault_subcat:
+        cps_get_entity_faults(params)
     else:
         error(log_id, log_funcname, sys._getframe().f_lineno,
               'Received CPS API get for unexpected subcategory ({0})'.format(subcat)
@@ -1506,11 +1557,13 @@ def init_server():
     #
     # Register as owner of temperature fault threshold objects
     #
-    cps.obj_register(cps.obj_init(),
-                     cps.key_from_name('target', 'base-env-tempctl'),
-                     { 'get': cps_get_cb, 'transaction': cps_xaction_cb }
-                     )
-        
+    h = cps.obj_init()
+    for k in (cps.key_from_name('target', 'base-env-tempctl/fault-threshold'),
+              cps.key_from_name('observed', 'base-env-tempctl/fault'),
+              cps.key_from_name('observed', 'base-env-tempctl/entity-fault')
+              ):
+        cps.obj_register(h, k, {'get': cps_get_cb, 'transaction': cps_xaction_cb})
+
 # Reset state
 
 def init_state():

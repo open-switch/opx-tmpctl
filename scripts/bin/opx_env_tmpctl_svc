@@ -178,11 +178,6 @@ def cps_delete(obj, attrs={}):
 def cps_key_qual(key):
     return ['', 'target', 'observed', 'proposed', 'realtime'][int(key.split('.')[0])]
 
-# Extract the subcategory from a CPS API key
-
-def cps_key_subcat(key):
-    return int(key.split('.')[2])
-
 # Publish a CPS API event
 
 def cps_publish(obj, attrs={}):
@@ -1219,24 +1214,24 @@ def fan_event_handler(obj):
     
 # Process a CPS API event
 
-subcat_entity      = cps_key_subcat(cps.key_from_name('observed', 'base-pas/entity'))
-subcat_temperature = cps_key_subcat(cps.key_from_name('observed', 'base-pas/temperature'))
-subcat_fan         = cps_key_subcat(cps.key_from_name('observed', 'base-pas/fan'))
+entity_key      = cps.key_from_name('observed', 'base-pas/entity')
+temperature_key = cps.key_from_name('observed', 'base-pas/temperature')
+fan_key         = cps.key_from_name('observed', 'base-pas/fan')
 
 def event_handler(obj):
     log_id = 'event'
     log_funcname = sys._getframe().f_code.co_name
     update = False
-    subcat = cps_key_subcat(obj['key'])
-    if subcat == subcat_entity:
+    k = obj['key']
+    if k == entity_key:
         update = entity_event_handler(obj)
-    elif subcat == subcat_temperature:
+    elif k == temperature_key:
         update = temperature_event_handler(obj)
-    elif subcat == subcat_fan:
+    elif k == fan_key:
         update = fan_event_handler(obj)
     else:
         error(log_id, log_funcname, sys._getframe().f_lineno,
-              'Received CPS API event for unexpected subcategory ({0})'.format(subcat)
+              'Received CPS API event for unexpected key ({0})'.format(k)
               )
     if update:
         zones_all_fan_speeds_set()
@@ -1447,9 +1442,9 @@ def cps_get_fault_thresholds(params):
 
 # Handler for received CPS API get requests
 
-temp_fault_subcat      = cps_key_subcat(cps.key_from_name('observed', 'base-env-tempctl/fault'))
-fault_threshold_subcat = cps_key_subcat(cps.key_from_name('observed', 'base-env-tempctl/fault-threshold'))
-entity_fault_subcat    = cps_key_subcat(cps.key_from_name('observed', 'base-env-tempctl/entity-fault'))
+temp_fault_key      = cps.key_from_name('observed', 'base-env-tempctl/fault')
+fault_threshold_key = cps.key_from_name('target', 'base-env-tempctl/fault-threshold')
+entity_fault_key    = cps.key_from_name('observed', 'base-env-tempctl/entity-fault')
 
 def cps_get_cb(method, params):
     log_id = 'cps_get'
@@ -1457,16 +1452,16 @@ def cps_get_cb(method, params):
     trace(log_id, log_funcname, sys._getframe().f_lineno,
           'Got CPS API get request'
           )
-    subcat = cps_key_subcat(params['filter']['key'])
-    if subcat == temp_fault_subcat:
+    k = params['filter']['key']
+    if k == temp_fault_key:
         cps_get_temp_faults(params)
-    elif subcat == fault_threshold_subcat:
+    elif k == fault_threshold_key:
         cps_get_fault_thresholds(params)
-    elif subcat == entity_fault_subcat:
+    elif k == entity_fault_key:
         cps_get_entity_faults(params)
     else:
         error(log_id, log_funcname, sys._getframe().f_lineno,
-              'Received CPS API get for unexpected subcategory ({0})'.format(subcat)
+              'Received CPS API get for unexpected key ({0})'.format(k)
               )
     return True
 
@@ -1536,13 +1531,13 @@ def cps_xaction_cb(methods, params):
         trace(log_id, log_funcname, sys._getframe().f_lineno,
               'Got CPS API set request'
               )
-        subcat = cps_key_subcat(params['change']['key'])
-        if subcat == fault_threshold_subcat:
+        k = params['change']['key']
+        if k == fault_threshold_key:
             cps_set_fault_thresholds(params)
         else:
             error(log_id, log_funcname, sys._getframe().f_lineno,
-                  'Received CPS API set for unexpected subcategory ({0})'
-                  .format(subcat)
+                  'Received CPS API set for unexpected key ({0})'
+                  .format(k)
                   )
     else:
         error(log_id, log_funcname, sys._getframe().f_lineno,
